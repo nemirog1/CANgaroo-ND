@@ -677,99 +677,152 @@ bool CandleApiInterface::takeConfirmedTx(const candle_fd_frame_t &echo, BusMessa
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// readMessage() — drain EVERY frame queued for this channel, not just one.
+//
+// LOCAL PATCH (ND Performance, 2026-09-29) — why this exists:
+//
+//   BusListener::run() calls readMessage() in a loop and sleeps
+//   QThread::msleep(1) after EVERY call. On Windows Sleep(1) costs ~1-2 ms,
+//   so a driver that hands back only ONE frame per call is capped at roughly
+//   500-1000 frames/s per channel. Measured on a W209 CAN-C capture:
+//   the bus produced ~1000 frames/s, CANgaroo consumed ~510 frames/s.
+//
+//   The shared reader thread (CandleSharedDevice::startReader) keeps pulling
+//   USB at full speed into the unbounded per-channel rxQueues[], so nothing
+//   is lost — the queue simply grows, every row it shows gets older and
+//   older, and the trace view fades those rows grey ("stale"). The backlog
+//   grew by ~0.5 s every second and never recovered.
+//
+//   The SLCAN driver does not have this problem because its readMessage()
+//   does readAll() and returns every buffered frame at once. This patch
+//   gives the Candle driver the same behaviour:
+//
+//     1. Block (up to timeout_ms) for the FIRST frame, exactly as before.
+//     2. Then keep popping with a ZERO timeout — readFrame(..., 0) builds an
+//        already-expired QDeadlineTimer, so it returns immediately once the
+//        channel's queue is empty — until the queue is empty or
+//        MaxFramesPerRead frames have been handled.
+//
+//   MaxFramesPerRead only bounds how long one call can hold the listener
+//   thread (so a stop request is still noticed promptly). At 512 frames per
+//   ~2 ms loop the ceiling is ~250k frames/s — far above any real CAN bus.
+//
+//   Per-frame handling (overflow flag, TX echo matching, error frame decode,
+//   classic/FD data copy, timestamp) is UNCHANGED from upstream; it has only
+//   moved inside the loop, with `continue` where upstream had an early
+//   `return`.
+//
+//   Return value: true if at least one message (data, echo or error) was
+//   appended to msglist. That matches upstream, which returned false only
+//   when nothing was appended (an unmatched echo with no overflow flag).
+// ---------------------------------------------------------------------------
 bool CandleApiInterface::readMessage(QList<BusMessage> &msglist, unsigned int timeout_ms)
 {
+    static constexpr int MaxFramesPerRead = 512;
+
     // The reader thread fills per-channel queues; we just wait for our channel.
     CandleQueuedFrame queuedFrame;
     if (!_sharedDev->readFrame(_channel, queuedFrame, timeout_ms)) {
         return false;
     }
-    candle_fd_frame_t frame = queuedFrame.frame;
-    const candle_frametype_t frameType = candle_fd_frame_type(&frame);
 
-    const int64_t frameTs_us = queuedFrame.timestampValid
-            ? static_cast<int64_t>(queuedFrame.timestampUs)
-            : static_cast<int64_t>(QDateTime::currentMSecsSinceEpoch()) * 1000LL;
+    const qsizetype sizeBefore = msglist.size();
+    int handled = 0;
 
-    // The device lost received frames before this one. The flag can ride on
-    // any frame, echoes included; like the Linux gs_usb driver, count it and
-    // report it as an RX overflow error.
-    const bool overflow = (frame.flags & CANDLE_FRAME_FLAG_OVERFLOW) != 0;
-    if (overflow) {
-        _numRxOverruns++;
-        BusMessage err;
-        err.setInterfaceId(getId());
-        err.setErrorFlag(BusError::Overrun);
-        err.setTimestamp_us(frameTs_us);
-        msglist.append(err);
-    }
+    do {
+        candle_fd_frame_t frame = queuedFrame.frame;
+        const candle_frametype_t frameType = candle_fd_frame_type(&frame);
 
-    if (frameType == CANDLE_FRAMETYPE_ECHO) {
-        // TX confirmation: the device transmitted one of our frames. Show it
-        // now, stamped with the device's transmit time.
-        BusMessage txMsg;
-        if (!takeConfirmedTx(frame, txMsg)) {
-            return overflow;
+        const int64_t frameTs_us = queuedFrame.timestampValid
+                ? static_cast<int64_t>(queuedFrame.timestampUs)
+                : static_cast<int64_t>(QDateTime::currentMSecsSinceEpoch()) * 1000LL;
+
+        // The device lost received frames before this one. The flag can ride on
+        // any frame, echoes included; like the Linux gs_usb driver, count it and
+        // report it as an RX overflow error.
+        const bool overflow = (frame.flags & CANDLE_FRAME_FLAG_OVERFLOW) != 0;
+        if (overflow) {
+            _numRxOverruns++;
+            BusMessage err;
+            err.setInterfaceId(getId());
+            err.setErrorFlag(BusError::Overrun);
+            err.setTimestamp_us(frameTs_us);
+            msglist.append(err);
         }
-        _numTx++;
-        txMsg.setInterfaceId(getId());
-        txMsg.setTimestamp_us(frameTs_us);
-        msglist.append(txMsg);
-        return true;
-    }
 
-    _numRx++;
-
-    BusMessage msg;
-    msg.setInterfaceId(getId());
-    msg.setId(candle_fd_frame_id(&frame));
-    msg.setExtended(candle_fd_frame_is_extended_id(&frame));
-
-    if (frameType == CANDLE_FRAMETYPE_ERROR) {
-        const uint32_t errId = candle_fd_frame_id(&frame);
-        const uint8_t *d = candle_fd_frame_data(&frame);
-        // The ID field carries error classes, not a CAN ID: don't show or
-        // decode it as one.
-        msg.setId(0);
-        msg.setExtended(false);
-        if (errId & 0x00000001) msg.setErrorFlag(BusError::TxTimeout);
-        if (errId & 0x00000020) msg.setErrorFlag(BusError::Ack);
-        if (errId & 0x00000040) msg.setErrorFlag(BusError::BusOff);
-        if (errId & 0x00000100) msg.setErrorFlag(BusError::Restarted);
-        if (errId & 0x00000004) {
-            if (d[1] & 0x03) msg.setErrorFlag(BusError::Overrun);
-            if (d[1] & 0x0C) msg.setErrorFlag(BusError::ErrorWarning);
-            if (d[1] & 0x30) msg.setErrorFlag(BusError::ErrorPassive);
-            if (d[1] & 0x40) msg.setErrorFlag(BusError::ErrorActive);
+        if (frameType == CANDLE_FRAMETYPE_ECHO) {
+            // TX confirmation: the device transmitted one of our frames. Show it
+            // now, stamped with the device's transmit time.
+            BusMessage txMsg;
+            if (takeConfirmedTx(frame, txMsg)) {
+                _numTx++;
+                txMsg.setInterfaceId(getId());
+                txMsg.setTimestamp_us(frameTs_us);
+                msglist.append(txMsg);
+            }
+            // Upstream returned here; we move on to the next queued frame.
+            continue;
         }
-        if (errId & 0x00000008) {
-            const uint8_t prot = d[2];
-            if (prot & 0x01) msg.setErrorFlag(BusError::Bit);
-            if (prot & 0x02) msg.setErrorFlag(BusError::Form);
-            if (prot & 0x04) msg.setErrorFlag(BusError::Stuff);
-            if (prot & 0x18) msg.setErrorFlag(BusError::Bit);
-            if (d[3] == 0x08) msg.setErrorFlag(BusError::Crc);
+
+        _numRx++;
+
+        BusMessage msg;
+        msg.setInterfaceId(getId());
+        msg.setId(candle_fd_frame_id(&frame));
+        msg.setExtended(candle_fd_frame_is_extended_id(&frame));
+
+        if (frameType == CANDLE_FRAMETYPE_ERROR) {
+            const uint32_t errId = candle_fd_frame_id(&frame);
+            const uint8_t *d = candle_fd_frame_data(&frame);
+            // The ID field carries error classes, not a CAN ID: don't show or
+            // decode it as one.
+            msg.setId(0);
+            msg.setExtended(false);
+            if (errId & 0x00000001) msg.setErrorFlag(BusError::TxTimeout);
+            if (errId & 0x00000020) msg.setErrorFlag(BusError::Ack);
+            if (errId & 0x00000040) msg.setErrorFlag(BusError::BusOff);
+            if (errId & 0x00000100) msg.setErrorFlag(BusError::Restarted);
+            if (errId & 0x00000004) {
+                if (d[1] & 0x03) msg.setErrorFlag(BusError::Overrun);
+                if (d[1] & 0x0C) msg.setErrorFlag(BusError::ErrorWarning);
+                if (d[1] & 0x30) msg.setErrorFlag(BusError::ErrorPassive);
+                if (d[1] & 0x40) msg.setErrorFlag(BusError::ErrorActive);
+            }
+            if (errId & 0x00000008) {
+                const uint8_t prot = d[2];
+                if (prot & 0x01) msg.setErrorFlag(BusError::Bit);
+                if (prot & 0x02) msg.setErrorFlag(BusError::Form);
+                if (prot & 0x04) msg.setErrorFlag(BusError::Stuff);
+                if (prot & 0x18) msg.setErrorFlag(BusError::Bit);
+                if (d[3] == 0x08) msg.setErrorFlag(BusError::Crc);
+            }
+            // CAN_ERR_BUSERROR (0x80) or anything unclassified
+            if (!msg.isErrorFrame()) msg.setErrorFlag(BusError::Generic);
         }
-        // CAN_ERR_BUSERROR (0x80) or anything unclassified
-        if (!msg.isErrorFrame()) msg.setErrorFlag(BusError::Generic);
-    }
-    msg.setRTR(candle_fd_frame_is_rtr(&frame));
+        msg.setRTR(candle_fd_frame_is_rtr(&frame));
 
-    const bool isFd = candle_fd_frame_is_fd(&frame);
-    msg.setFD(isFd);
-    msg.setBRS(isFd && candle_fd_frame_is_brs(&frame));
+        const bool isFd = candle_fd_frame_is_fd(&frame);
+        msg.setFD(isFd);
+        msg.setBRS(isFd && candle_fd_frame_is_brs(&frame));
 
-    const uint8_t raw_dlc = candle_fd_frame_dlc(&frame);
-    const uint8_t len = isFd ? candle_dlc_to_len(raw_dlc) : raw_dlc;
-    uint8_t *data = candle_fd_frame_data(&frame);
-    msg.setLength(len);
-    for (int i = 0; i < len; i++) {
-        msg.setByte(i, data[i]);
-    }
+        const uint8_t raw_dlc = candle_fd_frame_dlc(&frame);
+        const uint8_t len = isFd ? candle_dlc_to_len(raw_dlc) : raw_dlc;
+        uint8_t *data = candle_fd_frame_data(&frame);
+        msg.setLength(len);
+        for (int i = 0; i < len; i++) {
+            msg.setByte(i, data[i]);
+        }
 
-    msg.setTimestamp_us(frameTs_us);
-    msglist.append(msg);
-    return true;
+        msg.setTimestamp_us(frameTs_us);
+        msglist.append(msg);
+
+    // `continue` above jumps HERE, so an echo still counts toward the cap and
+    // still pulls the next frame. readFrame(..., 0) never blocks.
+    } while (++handled < MaxFramesPerRead
+             && _sharedDev->readFrame(_channel, queuedFrame, 0));
+
+    return msglist.size() > sizeBefore;
 }
 
 bool CandleApiInterface::updateStatistics()
