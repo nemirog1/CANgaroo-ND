@@ -2,6 +2,12 @@
 # <img src="src/assets/cangaroo.png" width="48" height="48"> CANgaroo
 **Open-source CAN bus analyzer for Linux 🐧 / Windows 🪟**
 
+> ### ℹ️ About this fork — CANgaroo-ND
+> **CANgaroo-ND** is ND Performance's fork of [Schildkroet/CANgaroo](https://github.com/Schildkroet/CANgaroo),
+> maintained for use with the **ND_UGW** multi-bus CAN/LIN gateway (a multi-channel gs_usb / candleLight device).
+> It tracks upstream and carries a small number of changes, listed in [ND fork changes](#-nd-fork-changes) below.
+> Base: upstream commit `d04e441` (2026-09-20). Everything else in this README is upstream's documentation.
+
 **🔩 Supported Interfaces & Hardware:**
 
 | Interface | Linux | Windows | Notes |
@@ -43,6 +49,63 @@
 * 🇺🇸 English
 * 🇪🇸 Spain
 * 🇨🇳 Chinese
+
+## 🔧 ND fork changes
+
+Modified by ND Performance, 2026-09-30 (GPL-2.0-or-later, as the original).
+
+### 1. Candlelight / gs_usb driver: no more lag at high frame rates (Windows)
+
+**File:** `src/driver/CandleApiDriver/CandleApiInterface.cpp` — `readMessage()` only.
+
+**Problem.** Each interface's listener thread (`BusListener::run()`) sleeps `QThread::msleep(1)` after every
+`readMessage()` call. The Candlelight driver returned exactly **one frame per call**, and on Windows `Sleep(1)`
+costs ~1–2 ms, so each Candlelight channel was capped at roughly **500–1000 frames/s**. Frames were not lost —
+the driver's reader thread kept filling an unbounded per-channel queue — but on a busy bus (e.g. a 500 kbit/s
+automotive bus at ~1000+ frames/s) the queue grew without limit, the display fell further and further behind
+real time, and the trace views faded the ever-older rows grey as "stale".
+Measured before the fix: a ~1000 frames/s channel was consumed at ~510 frames/s and its lag grew by ~0.5 s every second.
+
+**Fix.** `readMessage()` still blocks (up to the timeout) for the first frame exactly as before, then drains
+every further frame already queued for that channel with a zero-timeout read (up to 512 per call) and returns
+them together. The per-frame handling (overflow flag, TX-echo matching, error frames, classic/FD data,
+timestamps) is unchanged. `BusListener` and its 1 ms sleep are **deliberately untouched**: upstream added that
+sleep (commit `1df9254`) to stop drivers that ignore their timeout, such as GrIP, from busy-spinning a CPU core.
+
+**Verified** on an ND_UGW with two buses at ~1530 + ~350 frames/s: both channels delivered in real time,
+no backlog, no loss.
+
+> The LindeAPI (lin_usb) driver uses the same one-frame-per-call pattern and would benefit from the same change;
+> it is not modified here.
+
+### 2. Standalone Windows package script
+
+**File:** `deploy_cangaroo.sh` (repository root). Builds a release and assembles a self-contained `dist/`
+folder (Qt runtime and plugins, MinGW runtime DLLs, embedded Python runtime, example scripts) that runs by
+double-clicking `cangaroo.exe` on a PC without MSYS2. See [Windows (MSYS2)](#-windows-msys2--recommended-for-this-fork) below.
+
+### 3. Prebuilt Windows package in `dist/`
+
+The repository includes a ready-to-run 64-bit Windows build in [`dist/`](dist/), produced by `deploy_cangaroo.sh`
+from this fork's source. **No build tools needed:** download or clone the repo, copy the whole `dist` folder
+anywhere and double-click `dist\cangaroo.exe`. It is refreshed by re-running the script and committing the result,
+so it may lag the newest source commit slightly.
+
+### 4. Build documentation
+
+[`docs/BUILD_WINDOWS.md`](docs/BUILD_WINDOWS.md): complete Windows build and packaging guide.
+
+### 5. `.gitignore`
+
+Upstream's rules ignore `*.dll`, `bin/`, `build/` and similar, which would strip the package. A block at the end of
+`.gitignore` re-includes everything under `dist/`; it must stay last. A local `error.log` is ignored.
+
+### Known issue (under investigation)
+
+In the **Aggregated** trace view, rows from a slower channel (e.g. 83.3 kbit/s bus, 100 ms messages) can fade
+grey and then refresh in a top-to-bottom sweep while a much busier channel is also running. The frames
+themselves arrive in real time (the Rolling Log view keeps up, and saved traces are complete and correctly
+timed); this is a display-side issue still being isolated.
 
 ## 🛠️ Building
 ### 🐧 Linux
@@ -105,7 +168,72 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 > **Note:** Your user must be in the `plugdev` group (`sudo usermod -aG plugdev $USER`, then log out and back in).
 
-### 🪟 Windows
+### 🪟 Windows (MSYS2) — recommended for this fork
+
+> 📘 **Full step-by-step guide:** [`docs/BUILD_WINDOWS.md`](docs/BUILD_WINDOWS.md) — from a bare PC (Git, MSYS2, packages) through build, standalone packaging, testing, committing, updating and troubleshooting. The summary below is the short version.
+
+This mirrors the upstream project's own Windows CI build (MinGW + Qt 6 from MSYS2).
+
+**Important:** install MSYS2 to a path **without spaces** — the default `C:\msys64`. Under
+`C:\Program Files\msys64` the qmake-generated Makefile breaks (`C:/Program: No such file or directory`, Error 127).
+Run every command below in the **MSYS2 MINGW64** shell (Start menu, purple icon) — not `cmd`, PowerShell,
+"MSYS2 MSYS" or "UCRT64".
+
+#### 1. Install and update MSYS2
+
+Install from [msys2.org](https://www.msys2.org) into `C:\msys64`, open **MSYS2 MINGW64**, then:
+```bash
+pacman -Syu        # if it closes the window, reopen MSYS2 MINGW64 and continue:
+pacman -Su         # repeat until there is nothing to do
+```
+
+#### 2. Install the toolchain, Qt 6 and dependencies
+```bash
+pacman -S --needed mingw-w64-x86_64-toolchain mingw-w64-x86_64-qt6 mingw-w64-x86_64-qt6-tools \
+    mingw-w64-x86_64-make mingw-w64-x86_64-python mingw-w64-x86_64-pybind11 \
+    mingw-w64-x86_64-pkgconf mingw-w64-x86_64-ntldd git
+```
+Check: `cygpath -w /mingw64` must print `C:\msys64\mingw64`, and `which qmake6 mingw32-make gcc python`
+must list four paths under `/mingw64/bin/`.
+
+#### 3. Clone
+```bash
+cd /c/Users/<you>/source/repos
+git clone https://github.com/nemirog1/CANgaroo-ND.git
+cd CANgaroo-ND
+```
+
+#### 4. Build and run (inside MSYS2)
+```bash
+qmake6 CONFIG+=release
+mingw32-make -j$(nproc)
+./bin/cangaroo.exe
+```
+Clean rebuild: `rm -f .qmake.stash Makefile* src/Makefile*`, then the two build commands again.
+
+#### 5. Standalone package (runs outside MSYS2)
+```bash
+bash deploy_cangaroo.sh
+```
+Result: `dist\` in the clone. Copy the **whole folder** anywhere and double-click `cangaroo.exe`.
+To publish a refreshed package: `git add -A dist` then commit and push (the script deletes and rebuilds `dist\` each run, so removed files are picked up too).
+To confirm it is really standalone, make sure `C:\msys64\mingw64\bin` is not on the Windows `PATH` when you launch it.
+
+#### Harmless messages
+* `SyntaxError: Expected one or more names after 'import'` (three times, during qmake): `src.pro`'s Python
+  one-liner that locates pybind11 gets its quotes mangled; the headers are found in `/mingw64/include` anyway.
+* `VectorDriver: failed to enumerate devices: Cannot load library vxlapi64` in the log: the Vector XL driver
+  library is not installed. The deploy script removes the Vector plugin from `dist/`; for in-shell runs, move
+  `/mingw64/share/qt6/plugins/canbus/qtvectorcanbus.dll` elsewhere to silence it.
+
+#### Notes
+* Qt Creator is no longer packaged by MSYS2 for MINGW64. If you want the IDE, install the standalone
+  [Qt Creator](https://download.qt.io/official_releases/qtcreator/) and point its kit at
+  `C:\msys64\mingw64\bin\qmake6.exe`, `gcc.exe`/`g++.exe` and `gdb.exe`.
+* Candlelight / gs_usb devices appear as `candle<N>_ch<M>` (e.g. an ND_UGW shows `candle0_ch0` … `candle0_ch6`).
+  Only one program can have a gs_usb device open at a time.
+
+### 🪟 Windows (Qt online installer — upstream instructions)
 
 * Install [Qt 6](https://www.qt.io/download-qt-installer) (Community / Open Source) including the **Qt Serial Bus** component.
 * Install [Python 3](https://www.python.org/downloads/) and [pybind11](https://github.com/pybind/pybind11) (`pip install pybind11`).
@@ -182,7 +310,7 @@ canconvert TCU.arxml TCU.dbc
 
 ## 📥 Download
 
-Download the latest release from the [Releases](https://github.com/Schildkroet/CANgaroo).
+Upstream releases: [Schildkroet/CANgaroo](https://github.com/Schildkroet/CANgaroo). This fork (CANgaroo-ND) ships a prebuilt Windows package in [`dist/`](dist/) — copy the folder and run `cangaroo.exe`; to build it yourself see [Windows (MSYS2)](#-windows-msys2--recommended-for-this-fork).
 
 ## 📜 Credits
 
@@ -194,6 +322,7 @@ Further development by:
 * Schildkroet (https://github.com/Schildkroet/CANgaroo)
 * Wikilift (https://github.com/wikilift/CANgaroo)
 * Jayachandran Dharuman (https://github.com/OpenAutoDiagLabs/cangaroo)
+* ND Performance — CANgaroo-ND fork (https://github.com/nemirog1/CANgaroo-ND)
 
 ## DISCLAIMER
 

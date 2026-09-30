@@ -3,9 +3,9 @@
 # deploy_cangaroo.sh — build a STANDALONE CANgaroo folder that runs outside MSYS2
 # -----------------------------------------------------------------------------
 # Where to put it : the top folder of your CANgaroo clone
-#                   (e.g. C:\Users\neil\source\repos\CANgaroo-ND\deploy_cangaroo.sh)
+#                   (e.g. C:\dev\CANgaroo-ND\deploy_cangaroo.sh — any path without spaces)
 # How to run      : in the "MSYS2 MINGW64" shell:
-#                       cd /c/Users/neil/source/repos/CANgaroo-ND
+#                       cd /c/dev/CANgaroo-ND        # your clone
 #                       bash deploy_cangaroo.sh
 # Result          : ./dist/ holds cangaroo.exe plus every DLL, Qt plugin and the
 #                   Python runtime it needs. Copy the whole dist folder anywhere
